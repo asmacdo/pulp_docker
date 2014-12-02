@@ -9,6 +9,11 @@ Prerequisites
 The only requirement is to meet the prerequisites of the Pulp Platform. Please
 see the `Pulp User Guide`_ for prerequisites including repository setup.
 
+.. note::
+
+   If you are installing from source on Fedora, you will need to install ``docker-io`` instead
+   of ``docker``.
+
 Server
 ------
 
