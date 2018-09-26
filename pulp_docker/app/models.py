@@ -3,7 +3,10 @@ from types import SimpleNamespace
 
 from django.db import models
 
+from pulpcore.plugin.download import DownloaderFactory
 from pulpcore.plugin.models import Content, Remote, Publisher
+
+from . import downloaders
 
 
 logger = getLogger(__name__)
@@ -192,3 +195,45 @@ class DockerRemote(Remote):
     """
 
     TYPE = 'docker'
+
+    upstream_name = models.CharField(max_length=255, db_index=True)
+
+    @property
+    def download_factory(self):
+        """
+        Return the DownloaderFactory which can be used to generate asyncio capable downloaders.
+
+        Upon first access, the DownloaderFactory is instantiated and saved internally.
+
+        Plugin writers are expected to override when additional configuration of the
+        DownloaderFactory is needed.
+
+        Returns:
+            DownloadFactory: The instantiated DownloaderFactory to be used by
+                get_downloader()
+        """
+        token_auth_downloaders= {
+            # TODO(asmacdo) override for 401
+            'http': downloaders.TokenAuthHttpDownloader,
+            # TODO(asmacdo)
+            'https': downloaders.TokenAuthHttpDownloader,
+        }
+        try:
+            return self._download_factory
+        except AttributeError:
+            self._download_factory = DownloaderFactory(self, downloader_overrides=token_auth_downloaders)
+            return self._download_factory
+
+
+    @property
+    def namespaced_upstream_name(self):
+        """
+        Returns an upstream Docker repository name with a namespace.
+
+        For upstream repositories that do not have a namespace, the convention is to use 'library'
+        as the namespace.
+        """
+        if '/' not in self.upstream_name:
+            return 'library/{name}'.format(name=self.upstream_name)
+        else:
+            return self.upstream_name
