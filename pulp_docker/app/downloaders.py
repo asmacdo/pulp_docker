@@ -50,7 +50,7 @@ class TokenAuthHttpDownloader(HttpDownloader):
         this_token = self.remote.token['token']
         auth_headers = self.auth_header(this_token)
         headers.update(auth_headers)
-        dl_log.info("Fetching from URL: {url}".format(url=self.url))
+        # dl_log.info("Fetching from URL: {url}".format(url=self.url))
         async with self.session.get(self.url, headers=headers) as response:
             try:
                 response.raise_for_status()

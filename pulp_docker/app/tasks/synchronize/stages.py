@@ -7,77 +7,78 @@ To start with, we need to create a stage that emits 2 outputs.
   - pass the qs into the stage as it's future is ensured
   - ensure_future adds the stage to the event loop
 """
+from urllib.parse import urljoin
 import asyncio
+import json
 
-from pulpcore.plugin.stages import Stage
+from pulpcore.plugin.models import Artifact, ProgressBar, Repository, RepositoryVersion  # noqa
+
+from pulp_docker.app.models import (ImageManifest, DockerRemote, MEDIA_TYPE, ManifestBlob,
+                                    ManifestList, Tag)
+from pulp_docker.app.tasks.synchronizing import V2_ACCEPT_HEADERS
+
+from pulpcore.plugin.stages import (
+    ArtifactDownloaderRunner,
+    DeclarativeArtifact,
+    DeclarativeContent,
+    DeclarativeVersion,
+    Stage
+)
+
 
 import logging
 log = logging.getLogger("CONFLUENCE SANITY STAGES")
 
-
-class StartEmit2(Stage):
-    """
-    Starts without an in_q, emits to 2 different out_qs.
-    """
-    async def __call__(self, even_out, odd_out):
-        for i in range(1, 10):
-            if i % 2 == 0:
-                await even_out.put(i)
-            else:
-                await odd_out.put(i)
-            log.info("--------------------------------------------------------{i}--------------------STart".format(i=i))
-        await even_out.put(None)
-        await odd_out.put(None)
+tag_log = logging.getLogger("TAGLIST")
 
 
-class EvenInOddOut(Stage):
-    async def __call__(self, even_in, odd_out):
-        while True:
-            even = await even_in.get()
-            if even is None:
-                break
-            # Extra digits will show which q it went through.
-            new_odd = (even * 1000) + 1
-            log.info("eveninoddout---------------{i}------------------".format(i=new_odd))
-            await odd_out.put(new_odd)
-        await odd_out.put(None)
+class V2_API:
+
+    @staticmethod
+    def tags_list_url(remote):
+        relative_url = '/v2/{name}/tags/list'.format(name=remote.namespaced_upstream_name)
+        return urljoin(remote.url, relative_url)
+
+    @staticmethod
+    def get_tag_url(remote, tag):
+        relative_url = '/v2/{name}/manifests/{tag}'.format(
+            name=remote.namespaced_upstream_name,
+            tag=tag
+        )
+        return urljoin(remote.url, relative_url)
 
 
 class ConfluenceStage(Stage):
-    async def __call__(self, jack_in, walter_in, together_out):
+    """
+    Waits on an arbitrary number of input queues and outputs as single queue.
+    """
+    async def __call__(self, in_q_list, joined_out):
         self._pending = set()
         self._finished = set()
-        jack_task = self.add_to_pending(jack_in.get())
-        walter_task = self.add_to_pending(walter_in.get())
-        open_jack = True
-        open_walter = True
-        while open_jack or open_walter:
-            if self._pending:
-                done, self._pending = await asyncio.wait(
-                    self._pending,
-                    return_when=asyncio.FIRST_COMPLETED
-                )
-                self._finished = self._finished.union(done)
+        open_queues = [None for q in in_q_list]
+        current_tasks = {}
+        for queue in in_q_list:
+            task = self.add_to_pending(queue.get())
+            current_tasks[task] = queue
+
+        while open_queues:
+            done, self._pending = await asyncio.wait(
+                self._pending,
+                return_when=asyncio.FIRST_COMPLETED
+            )
+            self._finished = self._finished.union(done)
 
             while self._finished:
-                in_from_one_of_em = self._finished.pop()
-                if in_from_one_of_em.result() is None:
-                    if in_from_one_of_em is jack_task:
-                        open_jack = False
-                    elif in_from_one_of_em is walter_task:
-                        open_walter = False
+                out_task = self._finished.pop()
+                if out_task.result() is None:
+                    open_queues.pop()
                 else:
-                    if in_from_one_of_em is jack_task:
-                        jack_task = self.add_to_pending(jack_in.get())
-                    elif in_from_one_of_em is walter_task:
-                        walter_task = self.add_to_pending(walter_in.get())
-
-                await together_out.put(in_from_one_of_em.result())
-            # if (open_walter or open_jack) and not (open_walter and open_jack):
-            #     import ipdb; ipdb.set_trace()
-
+                    used_queue = current_tasks.pop(out_task)
+                    next_task = self.add_to_pending(used_queue.get())
+                    current_tasks[next_task] = used_queue
+                    await joined_out.put(out_task.result())
         # After both inputs are finished (2 Nones) we close this stage
-        await together_out.put(None)
+        await joined_out.put(None)
 
     def add_to_pending(self, coro):
         task = asyncio.ensure_future(coro)
@@ -97,6 +98,70 @@ class DidItWorkStage(Stage):
         while True:
             log_it = await in_q.get()
             if log_it is not None:
-                log.info(log_it)
+                log.info(log_it.d_artifacts)
             else:
                 break
+
+
+class TagListStage(Stage):
+    """
+    The first stage of a pulp_docker sync pipeline.
+    """
+
+    # TODO(asmacdo) self.remote is needed for Declarative artifacts, so needed by all plugins.
+    # Add this to the base class?
+    def __init__(self, remote, tag_out_queue):
+        """
+        The first stage of a pulp_docker sync pipeline.
+
+        Args:
+            remote (DockerRemote): The remote data to be used when syncing
+
+        """
+        self.remote = remote
+        self.extra_request_data = {'headers': V2_ACCEPT_HEADERS}
+        self._log_skipped_types = set()
+        self.tag_out = tag_out_queue
+
+    async def __call__(self):
+        """
+        Build and emit `DeclarativeContent` from the Manifest data.
+
+        Args:
+            in_q (asyncio.Queue): Unused because the first stage doesn't read from an input queue.
+            out_q (asyncio.Queue): The out_q to send `DeclarativeContent` objects to
+
+        """
+        with ProgressBar(message="Downloading Tags List") as pb:
+            tag_log.info("Fetching tags list for upstream repository: {repo}".format(
+                repo=self.remote.upstream_name
+            ))
+            list_downloader = self.remote.get_downloader(V2_API.tags_list_url(self.remote))
+            await list_downloader.run()
+
+            with open(list_downloader.path) as tags_raw:
+                tags_dict = json.loads(tags_raw.read())
+                tag_list = tags_dict['tags']
+            pb.increment()
+            for tag_name in tag_list:
+                await self.process_and_emit_tag(tag_name)
+                pb.increment()
+
+        tag_log.warn("Skipped types: {ctypes}".format(ctypes=self._log_skipped_types))
+        await self.tag_out.put(None)
+
+    async def process_and_emit_tag(self, tag_name):
+        tag = Tag(name=tag_name)
+        # Create now so downloader will download it, we'll pop it off later.
+        manifest_artifact = Artifact()  # ??? size path digests???
+        da = DeclarativeArtifact(
+            artifact=manifest_artifact,
+            url=V2_API.get_tag_url(self.remote, tag_name),
+            relative_path="TODO-where-should-this-go-{name}".format(name=tag_name),
+            remote=self.remote,
+            extra_data=self.extra_request_data,
+        )
+        tag_dc = DeclarativeContent(content=tag, d_artifacts=[da])
+        await self.tag_out.put(tag_dc)
+
+
