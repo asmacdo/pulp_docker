@@ -132,6 +132,27 @@ async def create_sync_pipeline(maxsize=100):
     blobs_in = blobs_out
     futures.append(asyncio.ensure_future(blob_stage(blobs_in, processed_dcs)))
 
+    # TODO(!breaksyncstages)create "Confluence"
+    # - A "confluence" is where 2 rivers join together. Here, a confluence is where 2
+    #   stage streams are treated as a single asyncio.Queue object.
+    # - this can be:
+    #      - ConfluenceStage(in_1, in_2, out_combined)
+    #           - Initial preference.
+    #           - PRO: more clearly present the structure of an already complex
+    #             flow by showing where the streams are joined.
+    #           - CON: stage structure is more complex
+    #           - Impression. The value of a very clear "circuit diagram" seems like it is worth
+    #             the cost of implementation in almost every case. Perhaps it would be useful
+    #             to log the stage order for all plugins, even with linear designs.
+
+    #      - For stages that it is convinient to override run(), is probably possible to do there.
+    #           - inital thinking: it would be a pain to repeat this logic everywhere, and more of
+    #                              pain because implementation would necessarily have to differ for
+    #                              stages that have a complicated run().
+    #      - Inititial Choice: ConfluenceStage
+
+    # TODO(breaksyncstages) Add Pulp stages
+
 
 
 
