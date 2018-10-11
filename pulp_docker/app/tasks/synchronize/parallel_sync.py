@@ -6,22 +6,28 @@ import logging
 
 from pulpcore.plugin.models import Artifact, ProgressBar, Repository, RepositoryVersion  # noqa
 from pulpcore.plugin.stages import (
+    ArtifactDownloader,
     ContentUnitAssociation,
     ContentUnitUnassociation,
+    ContentUnitSaver,
     DeclarativeArtifact,
     DeclarativeContent,
     DeclarativeVersion,
     EndStage,
-    Stage
+    QueryExistingContentUnits,
+    Stage,
 )
+
 from pulpcore.plugin.tasking import WorkingDirectory
 
 # TODO(asmacdo) alphabetize
 from pulp_docker.app.models import (ImageManifest, DockerRemote, MEDIA_TYPE, ManifestBlob,
                                     ManifestList, Tag)
 
+from .stages import (ConfluenceStage, ProcessNestedContentStage,
+                     DidItWorkStage, StupidArtifactSave, StupidContentSave,
+                     QueryAndSaveArtifacts, TagListStage)
 
-from .pipeline import create_sync_pipeline
 
 # log = logging.getLogger(__name__)
 tag_log = logging.getLogger("TAG")
@@ -59,21 +65,67 @@ def synchronize(remote_pk, repository_pk):
     DockerDeclarativeVersion(repository, remote).create()
 
 
-class DockerDeclarativeVersion:
+class DockerDeclarativeVersion(DeclarativeVersion):
 
     def __init__(self, repository, remote, mirror=True):
         self.repository = repository
         self.remote = remote
+        self.mirror = mirror
 
-    def create(self):
+    def pipeline_stages(self, new_version):
         """
-        Perform the work. This is the long-blocking call where all syncing occurs.
+        Build the list of pipeline stages feeding into the
+        ContentUnitAssociation stage.
+
+        Plugin-writers may override this method to build a custom pipeline. This
+        can be achieved by returning a list with different stages or by extending
+        the list returned by this method.
+
+        Args:
+            new_version (:class:`~pulpcore.plugin.models.RepositoryVersion`): The
+                new repository version that is going to be built.
+
+        Returns:
+            list: List of :class:`~pulpcore.plugin.stages.Stage` instances
+
         """
-        with WorkingDirectory():
-            with RepositoryVersion.create(self.repository) as new_version:
-                pipeline = create_sync_pipeline(self.remote, new_version)
-                loop = asyncio.get_event_loop()
-                loop.run_until_complete(pipeline)
+        return [
+            TagListStage(self.remote),
+
+            ArtifactDownloader(),
+            StupidArtifactSave(),
+            ProcessNestedContentStage(self.remote),
+            StupidContentSave(),
+
+            ArtifactDownloader(),
+            StupidArtifactSave(),
+            ProcessNestedContentStage(self.remote),
+            StupidContentSave(),
+
+            ArtifactDownloader(),
+            StupidArtifactSave(),
+            ProcessNestedContentStage(self.remote),
+            StupidContentSave(),
+
+            # QueryExistingContentUnits(),
+            # TODO move this stage (and my patch) to docker
+            # ContentUnitSaver(),
+            #
+            # ArtifactDownloader(),
+            # QueryAndSaveArtifacts(),
+            # ProcessNestedContentStage(self.remote),
+            # QueryExistingContentUnits(),
+            # ContentUnitSaver(),
+            #
+            # ArtifactDownloader(),
+            # QueryAndSaveArtifacts(),
+            # ProcessNestedContentStage(self.remote),
+            # QueryExistingContentUnits(),
+            # ContentUnitSaver(),
+            # QueryExistingArtifacts(), ArtifactDownloader(), ArtifactSaver(),
+            # QueryExistingContentUnits(), ContentUnitSaver(),
+        ]
+
 
     # def create(self):
     #     """
@@ -81,11 +133,7 @@ class DockerDeclarativeVersion:
     #     """
     #     with WorkingDirectory():
     #         with RepositoryVersion.create(self.repository) as new_version:
+    #             pipeline = create_sync_pipeline(self.remote, new_version)
     #             loop = asyncio.get_event_loop()
-    #             stages = self.pipeline_stages(new_version)
-    #             stages.append(ContentUnitAssociation(new_version))
-    #             if self.mirror:
-    #                 stages.append(ContentUnitUnassociation(new_version))
-    #             stages.append(EndStage())
-    #             pipeline = create_pipeline(stages)
     #             loop.run_until_complete(pipeline)
+    #
