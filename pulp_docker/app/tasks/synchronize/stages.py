@@ -11,6 +11,8 @@ from urllib.parse import urljoin
 import asyncio
 import json
 
+from django.db.models import Q
+
 from pulpcore.plugin.models import Artifact, ProgressBar, Repository, RepositoryVersion  # noqa
 
 from pulp_docker.app.models import (ImageManifest, DockerRemote, MEDIA_TYPE, ManifestBlob,
@@ -86,44 +88,96 @@ class ConfluenceStage(Stage):
         return task
 
 
-class SanityStage(Stage):
-    async def __call__(self, out_q):
-        for i in range(10):
-            await out_q.put(i)
+class QueryAndSaveArtifacts(Stage):
+    """
+    The stage that bulk saves only the artifacts that have not been saved before.
+    A stage that replaces :attr:`DeclarativeContent.d_artifacts` objects with
+    already-saved :class:`~pulpcore.plugin.models.Artifact` objects.
+    This stage expects :class:`~pulpcore.plugin.stages.DeclarativeContent` units from `in_q` and
+    inspects their associated :class:`~pulpcore.plugin.stages.DeclarativeArtifact` objects. Each
+    :class:`~pulpcore.plugin.stages.DeclarativeArtifact` object stores one
+    :class:`~pulpcore.plugin.models.Artifact`.
+    This stage inspects any unsaved :class:`~pulpcore.plugin.models.Artifact` objects and searches
+    using their metadata for existing saved :class:`~pulpcore.plugin.models.Artifact` objects inside
+    Pulp with the same digest value(s). Any existing :class:`~pulpcore.plugin.models.Artifact`
+    objects found will replace their unsaved counterpart in the
+    :class:`~pulpcore.plugin.stages.DeclarativeArtifact` object. Each remaining unsaved
+    :class:`~pulpcore.plugin.models.Artifact` is saved.
+    Each :class:`~pulpcore.plugin.stages.DeclarativeContent` is sent to `out_q` after all of its
+    :class:`~pulpcore.plugin.stages.DeclarativeArtifact` objects have been handled.
+    This stage drains all available items from `in_q` and batches everything into one large call to
+    the db for efficiency.
+    """
+
+    async def __call__(self, in_q, out_q):
+        """
+        The coroutine for this stage.
+        Args:
+            in_q (:class:`asyncio.Queue`): The queue to receive
+                :class:`~pulpcore.plugin.stages.DeclarativeContent` objects from.
+            out_q (:class:`asyncio.Queue`): The queue to put
+                :class:`~pulpcore.plugin.stages.DeclarativeContent` into.
+        Returns:
+            The coroutine for this stage.
+        """
+        async for batch in self.batches(in_q):
+            all_artifacts_q = Q(pk=None)
+            for content in batch:
+                for declarative_artifact in content.d_artifacts:
+                    one_artifact_q = Q()
+                    for digest_name in declarative_artifact.artifact.DIGEST_FIELDS:
+                        digest_value = getattr(declarative_artifact.artifact, digest_name)
+                        if digest_value:
+                            key = {digest_name: digest_value}
+                            one_artifact_q &= Q(**key)
+                    if one_artifact_q:
+                        all_artifacts_q |= one_artifact_q
+
+            for artifact in Artifact.objects.filter(all_artifacts_q):
+                for content in batch:
+                    for declarative_artifact in content.d_artifacts:
+                        for digest_name in artifact.DIGEST_FIELDS:
+                            digest_value = getattr(declarative_artifact.artifact, digest_name)
+                            if digest_value and digest_value == getattr(artifact, digest_name):
+                                declarative_artifact.artifact = artifact
+                                break
+
+            artifacts_to_save = []
+
+            for declarative_content in batch:
+                for declarative_artifact in declarative_content.d_artifacts:
+                    if declarative_artifact.artifact.pk is None:
+                        declarative_artifact.artifact.file = str(
+                            declarative_artifact.artifact.file)
+                        artifacts_to_save.append(declarative_artifact.artifact)
+
+            if artifacts_to_save:
+                Artifact.objects.bulk_create(artifacts_to_save)
+
+            for declarative_content in batch:
+                await out_q.put(declarative_content)
         await out_q.put(None)
 
 
-class DidItWorkStage(Stage):
-    async def __call__(self, in_q):
-        while True:
-            log_it = await in_q.get()
-            if log_it is not None:
-                log.info(log_it.d_artifacts)
-            else:
-                break
+class RemoteStage(Stage):
+    """
+    Stage aware of a docker remote.
+    """
+    def __init__(self, remote):
+        self.remote = remote
+        self.extra_request_data = {'headers': V2_ACCEPT_HEADERS}
+        # TODO(use or lose)
+        self.docker_api = V2_API
 
 
-class TagListStage(Stage):
+class TagListStage(RemoteStage):
     """
     The first stage of a pulp_docker sync pipeline.
     """
-
     # TODO(asmacdo) self.remote is needed for Declarative artifacts, so needed by all plugins.
     # Add this to the base class?
-    def __init__(self, remote, tag_out_queue):
-        """
-        The first stage of a pulp_docker sync pipeline.
 
-        Args:
-            remote (DockerRemote): The remote data to be used when syncing
-
-        """
-        self.remote = remote
-        self.extra_request_data = {'headers': V2_ACCEPT_HEADERS}
-        self._log_skipped_types = set()
-        self.tag_out = tag_out_queue
-
-    async def __call__(self):
+    async def __call__(self, pending_tag_out):
         """
         Build and emit `DeclarativeContent` from the Manifest data.
 
@@ -132,6 +186,7 @@ class TagListStage(Stage):
             out_q (asyncio.Queue): The out_q to send `DeclarativeContent` objects to
 
         """
+        tag_log.info('starting tag list')
         with ProgressBar(message="Downloading Tags List") as pb:
             tag_log.info("Fetching tags list for upstream repository: {repo}".format(
                 repo=self.remote.upstream_name
@@ -139,18 +194,18 @@ class TagListStage(Stage):
             list_downloader = self.remote.get_downloader(V2_API.tags_list_url(self.remote))
             await list_downloader.run()
 
-            with open(list_downloader.path) as tags_raw:
-                tags_dict = json.loads(tags_raw.read())
-                tag_list = tags_dict['tags']
+        with open(list_downloader.path) as tags_raw:
+            tags_dict = json.loads(tags_raw.read())
+            tag_list = tags_dict['tags']
+        pb.increment()
+        for tag_name in tag_list:
+            await self.create_and_emit_tag(tag_name, pending_tag_out)
             pb.increment()
-            for tag_name in tag_list:
-                await self.process_and_emit_tag(tag_name)
-                pb.increment()
 
-        tag_log.warn("Skipped types: {ctypes}".format(ctypes=self._log_skipped_types))
-        await self.tag_out.put(None)
+        # tag_log.warn("Skipped types: {ctypes}".format(ctypes=self._log_skipped_types))
+        await pending_tag_out.put(None)
 
-    async def process_and_emit_tag(self, tag_name):
+    async def create_and_emit_tag(self, tag_name, pending_tag_out):
         tag = Tag(name=tag_name)
         # Create now so downloader will download it, we'll pop it off later.
         manifest_artifact = Artifact()  # ??? size path digests???
@@ -162,6 +217,70 @@ class TagListStage(Stage):
             extra_data=self.extra_request_data,
         )
         tag_dc = DeclarativeContent(content=tag, d_artifacts=[da])
-        await self.tag_out.put(tag_dc)
+        await pending_tag_out.put(tag_dc)
 
 
+class ProcessTagStage(Stage):
+    """
+        process_tag_stage(unprocessed_tag_in, unprocessed_manifest_list_out,
+                          unprocessed_manifest_out1, processed_tag_out)
+    """
+    def __init__(self, remote):
+        self.remote = remote
+
+    async def __call__(self, unprocessed_tag_in, processed_manifest_list_out,
+                       unprocessed_manifest_out, processed_tag_out):
+        tag_log.info('process tag START')
+        while True:
+            tag_dc = await unprocessed_tag_in.get()
+            if tag_dc is None:
+                break
+            tag_log.info("NOT BROKEN HERE")
+            assert len(tag_dc.d_artifacts) == 1
+            with tag_dc.d_artifacts[0].artifact.file.open() as manifest_file:
+                raw = manifest_file.read()
+            manifest_data = json.loads(raw)
+            # TODO this emits the new content, but does not relate them. How can we
+            # store that relation to be made after all units have been saved?
+            #      - Idea: put the Tag class and the tag pk into the
+            #      DeclarativeArtifact.extra_data.
+            #      - ^ Nope, we don't have pk until the tag is saved.
+            #      - One way to do this:
+            #          - the Tag and the [Manifest|ManifestList] share an artifact,
+            #          - that artifact has a digest, which is the pk of both.
+            #              Tag.objects.get(pk=digest) Manifest.objects.get(pk=digest)
+            if manifest_data.get('mediaType') == MEDIA_TYPE.MANIFEST_LIST:
+                self.create_and_emit_manifest_list(tag_dc, manifest_data, processed_manifest_out1)
+            elif manifest_data.get('mediaType') == MEDIA_TYPE.MANIFEST_V2:
+                self.create_and_emit_manifest(manifest_data, unprocessed_manifest_list_out)
+
+        await unprocessed_manifest_list_out.put(None)
+        await unprocessed_manifest_out1.put(None)
+        await processed_tag_out.put(None)
+
+    # def create_and_emit_manifest(manifest_data, unprocessed_manifest_out1):
+    def create_and_emit_manifest_list(self, tag_dc, manifest_list_data, processed_manifest_list_out):
+        manifest_list = ManifestList(
+            # TODO might need to be sha256:asdfasd
+            digest=tag_dc.d_artifacts[0].artifact.sha256,
+            schema_version=manifest_list_data['schemaVersion'],
+            media_type=manifest_list_data['mediaType'],
+        )
+        list_dc = DeclarativeContent(content=manifest_list, d_artifacts=[tag_dc.d_artifacts[0]])
+        processed_manifest_list_out.put(list_dc)
+
+
+class ProcessManifestStage(Stage):
+    """
+        process_manifest_stage(unprocessed_manifest_in, pending_blob_out, processed_manifest_out)
+    """
+
+
+class DidItWorkStage(Stage):
+    async def __call__(self, in_q):
+        while True:
+            log_it = await in_q.get()
+            if log_it is not None:
+                log.info(log_it)
+            else:
+                break
