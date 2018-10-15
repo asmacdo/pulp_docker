@@ -1,7 +1,6 @@
 from logging import getLogger
 from types import SimpleNamespace
 import asyncio
-import json
 
 from django.db import models
 
@@ -29,33 +28,6 @@ class NotSchema2Exception(Exception):
     pass
 
 
-class ImageManifest(Content):
-    """
-    A docker manifest.
-
-    This content has one artifact.
-
-    Fields:
-        digest (models.CharField): The manifest digest.
-        schema_version (models.IntegerField): The docker schema version.
-        media_type (models.CharField): The manifest media type.
-    """
-
-    TYPE = 'manifest'
-
-    digest = models.CharField(max_length=255)
-    schema_version = models.IntegerField()
-    media_type = models.CharField(
-        max_length=60,
-        choices=(
-            (MEDIA_TYPE.MANIFEST_V1, MEDIA_TYPE.MANIFEST_V1),
-            (MEDIA_TYPE.MANIFEST_V2, MEDIA_TYPE.MANIFEST_V2),
-        ))
-
-    class Meta:
-        unique_together = ('digest',)
-
-
 class ManifestBlob(Content):
     """
     A blob defined within a manifest.
@@ -81,7 +53,34 @@ class ManifestBlob(Content):
             (MEDIA_TYPE.FOREIGN_BLOB, MEDIA_TYPE.FOREIGN_BLOB),
         ))
 
-    manifest = models.ForeignKey(ImageManifest, related_name='blobs', on_delete=models.CASCADE)
+    class Meta:
+        unique_together = ('digest',)
+
+
+class ImageManifest(Content):
+    """
+    A docker manifest.
+
+    This content has one artifact.
+
+    Fields:
+        digest (models.CharField): The manifest digest.
+        schema_version (models.IntegerField): The docker schema version.
+        media_type (models.CharField): The manifest media type.
+    """
+
+    TYPE = 'manifest'
+
+    digest = models.CharField(max_length=255)
+    schema_version = models.IntegerField()
+    media_type = models.CharField(
+        max_length=60,
+        choices=(
+            (MEDIA_TYPE.MANIFEST_V1, MEDIA_TYPE.MANIFEST_V1),
+            (MEDIA_TYPE.MANIFEST_V2, MEDIA_TYPE.MANIFEST_V2),
+        ))
+
+    blobs = models.ManyToManyField(ManifestBlob, through='BlobManifestBlob')
 
     class Meta:
         unique_together = ('digest',)
@@ -116,6 +115,13 @@ class ManifestList(Content):
 
     class Meta:
         unique_together = ('digest',)
+
+
+class BlobManifestBlob(models.Model):
+    manifest = models.ForeignKey(
+        ImageManifest, related_name='blob_manifests', on_delete=models.CASCADE)
+    manifest_blob = models.ForeignKey(
+        ManifestBlob, related_name='manifest_blobs', on_delete=models.CASCADE)
 
 
 class ManifestListManifest(models.Model):
