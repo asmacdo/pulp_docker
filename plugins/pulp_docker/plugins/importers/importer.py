@@ -423,6 +423,9 @@ class DockerImporter(Importer):
         for unit in units:
             type_dict[type(unit)].add(unit)
 
+        for unit in list(type_dict[models.ManifestList]) + list(type_dict[models.Manifest]):
+            self._purge_unlinked_tags(repo.repo_obj, unit)
+
         removed_unlinked_manifests = self._purge_unlinked_manifests(repo.repo_obj, type_dict[models.ManifestList])
         _logger.warn("removed unlinked_manifests")
         _logger.warn(removed_unlinked_manifests)
