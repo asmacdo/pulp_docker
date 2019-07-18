@@ -419,58 +419,6 @@ class DockerImporter(Importer):
         :param config: plugin configuration
         :type  config: pulp.plugins.config.PluginCallConfiguration
         """
-        # #### STEP 1 purge_unlinked_manifests
-        # # TODO this isnt real
-        # removed_manifest_lists = units.filter(constants.MANIFEST_LIST_TYPE_ID)
-        #
-        # # TODO s1,s2
-        # possibly_orphaned_manifests = unit_association.RepoUnitAssociationManager._units_from_criteria(
-        #     repo.repo_obj,
-        #     # TODO filter referenced by removed_manifest_lists
-        #     UnitAssociationCriteria(type_ids=[constants.MANIFEST_TYPE_ID])
-        # )
-        # remaining_manifest_lists = unit_association.RepoUnitAssociationManager._units_from_criteria(
-        #     repo.repo_obj,
-        #     UnitAssociationCriteria(type_ids=[constants.MANIFEST_LIST_TYPE_ID])
-        # )
-        #
-        # # TODO 1 query?
-        # orphaned_manifests = possibly_orphaned_manifests.filter(
-        #     not_referenced_by(remaining_manifest_lists)
-        # )
-        # orphaned_manifests.REMOVE()
-        #
-        # #### STEP 2 purge_unlinked_blobs
-        # # different than before
-        # remaining_manifests = unit_association.RepoUnitAssociationManager._units_from_criteria(
-        #     repo.repo_obj,
-        #     # TODO filter referenced by removed_manifest_lists
-        #     UnitAssociationCriteria(type_ids=[constants.MANIFEST_TYPE_ID])
-        # )
-        # remaining_blobs = unit_association.RepoUnitAssociationManager._units_from_criteria(
-        #     repo.repo_obj,
-        #     UnitAssociationCriteria(type_ids=[constants.MANIFEST_LIST_TYPE_ID])
-        # )
-
-        # rm_manifest_lists, rm_manifests = divide_units(units)
-        # remove(rm_manifest_lists)
-        #
-        # possibly_orphaned_manifests = get_related_units(rm_manifest_lists)
-        # adoptive_parent_manifest_lists = repo.content.manifests_lists(has__possibly_orphaned_manifsts)
-        #
-        #
-        #
-        # adopted_units = content_in_repo)
-        #
-        # import ipdb; ipdb.set_trace()
-
-        # unit_removers = {
-        #     models.Image: DockerImporter._remove_image,
-        #     models.Manifest: DockerImporter._remove_manifest,
-        #     models.ManifestList: DockerImporter._remove_manifest_list,
-        #     models.Tag: DockerImporter._remove_tag
-        # }
-        #
         type_dict = defaultdict(set)
         for unit in units:
             type_dict[type(unit)].add(unit)
@@ -489,6 +437,7 @@ class DockerImporter(Importer):
         _logger.warn(type_dict[models.Manifest])
         self._purge_unlinked_blobs(repo.repo_obj, type_dict[models.Manifest])
 
+    # TODO combine
     @staticmethod
     def _remove_image(repo, image):
         """
@@ -507,6 +456,7 @@ class DockerImporter(Importer):
         repo.scratchpad[u'tags'] = tags
         repo.save()
 
+    # TODO remove
     @classmethod
     def _remove_manifest(cls, repo, manifest):
         """
@@ -520,6 +470,7 @@ class DockerImporter(Importer):
         cls._purge_unlinked_tags(repo, manifest)
         cls._purge_unlinked_blobs(repo, manifest)
 
+    # TODO remove
     @classmethod
     def _remove_manifest_list(cls, repo, manifest_list):
         """
@@ -533,6 +484,7 @@ class DockerImporter(Importer):
         cls._purge_unlinked_tags(repo, manifest_list)
         cls._purge_unlinked_manifests(repo, manifest_list)
 
+    # TODO remove
     @classmethod
     def _remove_tag(cls, repo, tag):
         """
@@ -547,9 +499,18 @@ class DockerImporter(Importer):
 
     @staticmethod
     def _purge_unlinked_manifests(repo, manifest_lists):
+        """
+        Remove any content related to manifest lists that are otherwise unlinked in the repository.
 
-        # Find manifest digests referenced by removed manifest lists (orphaned)
+        :param repo: TODO
+        :type  repo: pulp.server.db.model.Repository
+        :param manifest_lists:
+        :type manifest_lists: TODO
+        """
+        # used for later query
         manifest_list_pks = set()
+
+        # set of related manifests that **might be** orphaned TODO change name
         orphaned = set()
         for manifest_list in manifest_lists:
             manifest_list_pks.add(manifest_list.pk)
@@ -558,18 +519,19 @@ class DockerImporter(Importer):
                 if manifest_list.amd64_digest:
                     orphaned.add(manifest_list.amd64_digest)
         if not orphaned:
-            # nothing orphaned
-            return
+            #  TODO replace with a list or handle Nonetype where function called
+            return models.Manifest.objects.filter(digest__in=sorted(orphaned))
         _logger.warn("POSSIBLE ORPHANS-----------------------------")
         _logger.warn(orphaned)
 
-        # Find manifest digests still referenced by other manifest lists (adopted)
+        # Find manifest digests still referenced by other manifest lists in the repo
         claimed = set()
+        # TODO I removed unit filters and it didn't work as expected, false positives
+        # does this mean that the units have not yet been removed?
         criteria = UnitAssociationCriteria(
             type_ids=[constants.MANIFEST_LIST_TYPE_ID],
             unit_filters={'_id': {'$nin': list(manifest_list_pks)}}
         )
-        # TODO I think we can remove this from ^ because these manifest lists are no longer in the repo
         for man_list in unit_association.RepoUnitAssociationManager._units_from_criteria(
                 repo, criteria):
             for image_man in man_list.manifests:
@@ -583,12 +545,14 @@ class DockerImporter(Importer):
         # Remove unreferenced manifests
         orphaned = orphaned.difference(claimed)
         if not orphaned:
-            # all adopted
-            return
+            # all potential orphans are still linked in repo
+            #  TODO replace with a list or handle Nonetype where function called
+            return models.Manifest.objects.filter(digest__in=sorted(orphaned))
         _logger.warn("STILL POSSIBLE ORPHANS-----------------------------")
         _logger.warn(orphaned)
 
         # Check if those manifests have tags, tagged manifests cannot be removed
+        # Note: Manifest.digest is the same as the Manifest.pk
         criteria = UnitAssociationCriteria(
             type_ids=[constants.TAG_TYPE_ID],
             unit_filters={'manifest_digest': {'$in': list(orphaned)},
@@ -675,7 +639,7 @@ class DockerImporter(Importer):
         # Find blob digests still referenced by other manifests (adopted)
         adopted = set()
         criteria = UnitAssociationCriteria(type_ids=[constants.MANIFEST_TYPE_ID],
-                                           unit_filters={'digest': {'$nin': list(manifest_pks)}})
+                                           unit_filters={'_id': {'$nin': list(manifest_pks)}})
         for manifest in unit_association.RepoUnitAssociationManager._units_from_criteria(
                 repo, criteria):
             map((lambda layer: adopted.add(layer.blob_sum)), manifest.fs_layers)
