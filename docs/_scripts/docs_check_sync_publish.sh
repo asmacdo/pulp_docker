@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+
+# This script will execute the component scripts and ensure that the documented examples
+# work as expected.
+
+# From the _scripts directory, run with `source docs_check_sync_publish.sh` (source to preserve the
+# environment variables)
+
+# TODO REMOVE
+pclean
+prestart
+sleep 5
+# TODO REMOVE
+
+source base.sh
+
+source repo.sh
+source remote.sh
+source sync.sh
+#
+source distribution.sh
+source download_after_sync.sh
